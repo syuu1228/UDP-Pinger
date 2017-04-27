@@ -30,179 +30,147 @@
 #define TIMEOUT 2
 #define BUFSIZE 100
 
-static int __poll(int fd)
+static void printpacket(struct msghdr *msg, int res,
+			char *data,
+			int sock, int recvmsg_flags)
 {
-    struct pollfd pollfd = {fd, POLLPRI, 0};
-    int ret;
+	struct sockaddr_in *from_addr = (struct sockaddr_in *)msg->msg_name;
+	struct cmsghdr *cmsg;
+	struct timeval tv;
+	struct timespec ts;
+	struct timeval now;
 
-    ret = poll(&pollfd, 1, 100);
-    if (ret != 1) {
-        if (errno) {
-            error(1, errno, "poll");
-        }else{
-            fprintf(stderr, "poll for tx timestamp timeout.\n");
-            return -1;
-        }
-    }
-    return 0;
+	gettimeofday(&now, 0);
+
+	printf("%ld.%06ld: received %s data, %d bytes from %s, %zu bytes control messages\n",
+	       (long)now.tv_sec, (long)now.tv_usec,
+	       (recvmsg_flags & MSG_ERRQUEUE) ? "error" : "regular",
+	       res,
+	       inet_ntoa(from_addr->sin_addr),
+	       msg->msg_controllen);
+	for (cmsg = CMSG_FIRSTHDR(msg);
+	     cmsg;
+	     cmsg = CMSG_NXTHDR(msg, cmsg)) {
+		printf("   cmsg len %zu: ", cmsg->cmsg_len);
+		switch (cmsg->cmsg_level) {
+		case SOL_SOCKET:
+			printf("SOL_SOCKET ");
+			switch (cmsg->cmsg_type) {
+			case SO_TIMESTAMP: {
+				struct timeval *stamp =
+					(struct timeval *)CMSG_DATA(cmsg);
+				printf("SO_TIMESTAMP %ld.%06ld",
+				       (long)stamp->tv_sec,
+				       (long)stamp->tv_usec);
+				break;
+			}
+			case SO_TIMESTAMPNS: {
+				struct timespec *stamp =
+					(struct timespec *)CMSG_DATA(cmsg);
+				printf("SO_TIMESTAMPNS %ld.%09ld",
+				       (long)stamp->tv_sec,
+				       (long)stamp->tv_nsec);
+				break;
+			}
+			case SO_TIMESTAMPING: {
+				struct timespec *stamp =
+					(struct timespec *)CMSG_DATA(cmsg);
+				printf("SO_TIMESTAMPING ");
+				printf("SW %ld.%09ld ",
+				       (long)stamp->tv_sec,
+				       (long)stamp->tv_nsec);
+				stamp++;
+				/* skip deprecated HW transformed */
+				stamp++;
+				printf("HW raw %ld.%09ld",
+				       (long)stamp->tv_sec,
+				       (long)stamp->tv_nsec);
+				break;
+			}
+			default:
+				printf("type %d", cmsg->cmsg_type);
+				break;
+			}
+			break;
+		case IPPROTO_IP:
+			printf("IPPROTO_IP ");
+			switch (cmsg->cmsg_type) {
+			case IP_RECVERR: {
+				struct sock_extended_err *err =
+					(struct sock_extended_err *)CMSG_DATA(cmsg);
+				printf("IP_RECVERR ee_errno '%s' ee_origin %d => %s",
+					strerror(err->ee_errno),
+					err->ee_origin,
+#ifdef SO_EE_ORIGIN_TIMESTAMPING
+					err->ee_origin == SO_EE_ORIGIN_TIMESTAMPING ?
+					"bounced packet" : "unexpected origin"
+#else
+					"probably SO_EE_ORIGIN_TIMESTAMPING"
+#endif
+					);
+				if (res < sizeof(sync))
+					printf(" => truncated data?!");
+				else if (!memcmp(sync, data + res - sizeof(sync),
+							sizeof(sync)))
+					printf(" => GOT OUR DATA BACK (HURRAY!)");
+				break;
+			}
+			case IP_PKTINFO: {
+				struct in_pktinfo *pktinfo =
+					(struct in_pktinfo *)CMSG_DATA(cmsg);
+				printf("IP_PKTINFO interface index %u",
+					pktinfo->ipi_ifindex);
+				break;
+			}
+			default:
+				printf("type %d", cmsg->cmsg_type);
+				break;
+			}
+			break;
+		default:
+			printf("level %d type %d",
+				cmsg->cmsg_level,
+				cmsg->cmsg_type);
+			break;
+		}
+		printf("\n");
+	}
 }
 
-static struct timespec ts_prev;
-static void __print_timestamp(const char *name, struct timespec *cur,
-                  uint32_t key, int payload_len)
+static void recvpacket(int sock, int recvmsg_flags)
 {
-    if (!(cur->tv_sec | cur->tv_nsec))
-        return;
+	char data[256];
+	struct msghdr msg;
+	struct iovec entry;
+	struct sockaddr_in from_addr;
+	struct {
+		struct cmsghdr cm;
+		char control[512];
+	} control;
+	int res;
 
-    fprintf(stderr, "  %s: %lu s %lu us (seq=%u, len=%u)",
-            name, cur->tv_sec, cur->tv_nsec / 1000,
-            key, payload_len);
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov = &entry;
+	msg.msg_iovlen = 1;
+	entry.iov_base = data;
+	entry.iov_len = sizeof(data);
+	msg.msg_name = (caddr_t)&from_addr;
+	msg.msg_namelen = sizeof(from_addr);
+	msg.msg_control = &control;
+	msg.msg_controllen = sizeof(control);
 
-    if ((ts_prev.tv_sec | ts_prev.tv_nsec)) {
-        int64_t cur_ms, prev_ms;
-
-        cur_ms = (long) cur->tv_sec * 1000 * 1000;
-        cur_ms += cur->tv_nsec / 1000;
-
-        prev_ms = (long) ts_prev.tv_sec * 1000 * 1000;
-        prev_ms += ts_prev.tv_nsec / 1000;
-
-        fprintf(stderr, "  (%+" PRId64 " us)", cur_ms - prev_ms);
-    }
-
-    ts_prev = *cur;
-    fprintf(stderr, "\n");
+	res = recvmsg(sock, &msg, recvmsg_flags|MSG_DONTWAIT);
+	if (res < 0) {
+		printf("%s %s: %s\n",
+		       "recvmsg",
+		       (recvmsg_flags & MSG_ERRQUEUE) ? "error" : "regular",
+		       strerror(errno));
+	} else {
+		printpacket(&msg, res, data,
+			    sock, recvmsg_flags);
+	}
 }
 
-static void print_timestamp(struct scm_timestamping *tss, int tstype,
-                int tskey, int payload_len)
-{
-    const char *tsname;
-
-    switch (tstype) {
-    case SCM_TSTAMP_SCHED:
-        tsname = "  ENQ";
-        break;
-    case SCM_TSTAMP_SND:
-        tsname = "  SND";
-        break;
-    case SCM_TSTAMP_ACK:
-        tsname = "  ACK";
-        break;
-    default:
-        error(1, 0, "unknown timestamp type: %u",
-        tstype);
-    }
-    __print_timestamp(tsname, &tss->ts[0], tskey, payload_len);
-}
-
-static void __recv_errmsg_cmsg(struct msghdr *msg, int payload_len)
-{
-    struct sock_extended_err *serr = NULL;
-    struct scm_timestamping *tss = NULL;
-    struct cmsghdr *cm;
-    int batch = 0;
-
-    for (cm = CMSG_FIRSTHDR(msg);
-         cm && cm->cmsg_len;
-         cm = CMSG_NXTHDR(msg, cm)) {
-        if (cm->cmsg_level == SOL_SOCKET &&
-            cm->cmsg_type == SCM_TIMESTAMPING) {
-            tss = (void *) CMSG_DATA(cm);
-        } else if ((cm->cmsg_level == SOL_IP &&
-                cm->cmsg_type == IP_RECVERR) ||
-               (cm->cmsg_level == SOL_IPV6 &&
-                cm->cmsg_type == IPV6_RECVERR)) {
-            serr = (void *) CMSG_DATA(cm);
-            if (serr->ee_errno != ENOMSG ||
-                serr->ee_origin != SO_EE_ORIGIN_TIMESTAMPING) {
-                fprintf(stderr, "unknown ip error %d %d\n",
-                        serr->ee_errno,
-                        serr->ee_origin);
-                serr = NULL;
-            }
-        } else
-            fprintf(stderr, "unknown cmsg %d,%d\n",
-                    cm->cmsg_level, cm->cmsg_type);
-
-        if (serr && tss) {
-            print_timestamp(tss, serr->ee_info, serr->ee_data,
-                    payload_len);
-            serr = NULL;
-            tss = NULL;
-            batch++;
-        }
-    }
-
-    if (batch > 1)
-        fprintf(stderr, "batched %d timestamps\n", batch);
-}
-
-static int recv_errmsg(int fd)
-{
-    static char ctrl[1024 /* overprovision*/];
-    static struct msghdr msg;
-    struct iovec entry;
-    int ret = 0;
-
-    memset(&msg, 0, sizeof(msg));
-    memset(&entry, 0, sizeof(entry));
-    memset(ctrl, 0, sizeof(ctrl));
-
-    entry.iov_base = NULL;
-    entry.iov_len = 0;
-    msg.msg_iov = &entry;
-    msg.msg_iovlen = 1;
-    msg.msg_name = NULL;
-    msg.msg_namelen = 0;
-    msg.msg_control = ctrl;
-    msg.msg_controllen = sizeof(ctrl);
-
-    ret = recvmsg(fd, &msg, MSG_ERRQUEUE);
-    if (ret == -1 && errno != EAGAIN)
-        error(1, errno, "recvmsg");
-
-    if (ret >= 0) {
-        __recv_errmsg_cmsg(&msg, ret);
-    }
-
-    return ret == -1;
-}
-
-static int hwts_init(int fd, const char *device)
-{
-    struct ifreq ifreq;
-    struct hwtstamp_config cfg, req;
-    int err;
-
-    memset(&ifreq, 0, sizeof(ifreq));
-    memset(&cfg, 0, sizeof(cfg));
-
-    strncpy(ifreq.ifr_name, device, sizeof(ifreq.ifr_name) - 1);
-
-    ifreq.ifr_data = (void *) &cfg;
-    cfg.tx_type    = HWTSTAMP_TX_ON;
-    cfg.rx_filter  = HWTSTAMP_FILTER_NONE;
-    req = cfg;
-    err = ioctl(fd, SIOCSHWTSTAMP, &ifreq);
-    if (err < 0) {
-        perror("ioctl(SIOCSHWTSTAMP)");
-        return err;
-    }
-
-    if (memcmp(&cfg, &req, sizeof(cfg))) {
-
-        printf("driver changed our HWTSTAMP options\n");
-        printf("tx_type   %d not %d\n", cfg.tx_type, req.tx_type);
-        printf("rx_filter %d not %d\n", cfg.rx_filter, req.rx_filter);
-
-        if (cfg.tx_type != req.tx_type) {
-            return -1;
-        }
-    }
-
-    return 0;
-}
 
 int main(int argc, char **argv){
     struct sockaddr_in myaddr;	//my address
@@ -223,8 +191,12 @@ int main(int argc, char **argv){
 // for timestamp
     unsigned int opt;
     char nic[50];
-    int err;
-    
+    int hw = 0;
+    struct ifreq device;
+    struct ifreq hwtstamp;
+    struct hwtstamp_config hwconfig, hwconfig_requested;
+    int enabled = 1;
+
     /* Get host name, port number, loop times */
     if(argc==5){
         strncpy(host_to_contact, argv[1], sizeof(host_to_contact));
@@ -278,8 +250,36 @@ int main(int argc, char **argv){
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,(char*)&timeout,sizeof(struct timeval));
 
     /* Enable TX timestamp */
-    err = hwts_init(fd, nic);
-    if (err == 0) { // with HW support
+    memset(&device, 0, sizeof(device));
+    strncpy(device.ifr_name, nic, sizeof(device.ifr_name));
+    if (ioctl(fd, SIOCGIFADDR, &device) < 0) {
+        perror("getting interface IP address");
+        exit(1);
+    }
+
+    memset(&hwtstamp, 0, sizeof(hwtstamp));
+    strncpy(hwtstamp.ifr_name, nic, sizeof(hwtstamp.ifr_name));
+    hwtstamp.ifr_data = (void *)&hwconfig;
+    memset(&hwconfig, 0, sizeof(hwconfig));
+    hwconfig.tx_type =HWTSTAMP_TX_ON;
+    hwconfig.rx_filter =HWTSTAMP_FILTER_NONE;
+    hwconfig_requested = hwconfig;
+    if (ioctl(fd, SIOCSHWTSTAMP, &hwtstamp) < 0) {
+        if ((errno == EINVAL || errno == ENOTSUP) &&
+            hwconfig_requested.tx_type == HWTSTAMP_TX_OFF &&
+            hwconfig_requested.rx_filter == HWTSTAMP_FILTER_NONE) {
+            printf("SIOCSHWTSTAMP: disabling hardware time stamping not possible\n");
+        } else {
+            perror("SIOCSHWTSTAMP");
+        }
+    } else {
+        hw = 1;
+    }
+    printf("SIOCSHWTSTAMP: tx_type %d requested, got %d; rx_filter %d requested, got %d\n",
+           hwconfig_requested.tx_type, hwconfig.tx_type,
+           hwconfig_requested.rx_filter, hwconfig.rx_filter);
+
+    if (hw) {
         printf("Enabling HW TX timestamp\n");
         opt = SOF_TIMESTAMPING_TX_HARDWARE |
             SOF_TIMESTAMPING_RAW_HARDWARE;
@@ -288,22 +288,25 @@ int main(int argc, char **argv){
         opt = SOF_TIMESTAMPING_TX_SOFTWARE |
             SOF_TIMESTAMPING_SOFTWARE;
     }
-    opt |= SOF_TIMESTAMPING_OPT_CMSG |
-        SOF_TIMESTAMPING_OPT_ID |
-        SOF_TIMESTAMPING_OPT_TSONLY;
     if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPING,
                (char *) &opt, sizeof(opt)))
         error(1, 0, "setsockopt timestamping");
-    opt = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_SELECT_ERR_QUEUE,
                (char *) &opt, sizeof(opt)))
         error(1, 0, "setsockopt timestamping");
+    /* request IP_PKTINFO for debugging purposes */
+    if (setsockopt(fd, SOL_IP, IP_PKTINFO,
+               &enabled, sizeof(enabled)) < 0)
+        error(1, 0, "setsockopt IP_PKTINFO");
 
    
     /* Send the messages and calculate RTT */
     
     for (i=0; i < times; i++) {
         char send_buf[] = "ping";
+        fd_set errorfs;
+        struct timeval tv;
+        int res;
         if (sendto(fd, send_buf, strlen(buf), 0, (struct sockaddr *)&remaddr, slen)==-1) {
             perror("sendto");
             printf("\n---------------\n");
@@ -313,11 +316,17 @@ int main(int argc, char **argv){
         printf("Ping packet send to %s port %d\n", host_to_contact, port);
 
         /* Receive TX timestamp */
-        if (__poll(fd) != 0) {
-            return -1;
+        FD_ZERO(&errorfs);
+        FD_SET(fd, &errorfs);
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        res = select(fd + 1, 0, 0, &errorfs, &tv);
+        if (res > 0 && FD_ISSET(fd, &errorfs)) {
+            recvpacket(fd, MSG_ERRQUEUE);
+        } else {
+            printf("Timeout to read from errqueue\n");
         }
-        while (!recv_errmsg(fd)) {}
-        
+
         /* Waiting message come back */
         int recvlen = recvfrom(fd, buf, BUFSIZE, 0, (struct sockaddr *)&remaddr, &slen);
         if (recvlen >= 0) {
