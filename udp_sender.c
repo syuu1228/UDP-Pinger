@@ -26,162 +26,157 @@
 #include <sys/time.h>
 #include <linux/sockios.h>
 #include <net/if.h>
+#include <sys/ioctl.h>
+#include <error.h>
 
 #define TIMEOUT 2
 #define BUFSIZE 100
 
 static void printpacket(struct msghdr *msg, int res,
-			char *data,
-			int sock, int recvmsg_flags)
+            char *data,
+            int sock, int recvmsg_flags)
 {
-	struct sockaddr_in *from_addr = (struct sockaddr_in *)msg->msg_name;
-	struct cmsghdr *cmsg;
-	struct timeval tv;
-	struct timespec ts;
-	struct timeval now;
+    struct sockaddr_in *from_addr = (struct sockaddr_in *)msg->msg_name;
+    struct cmsghdr *cmsg;
+    struct timeval now;
 
-	gettimeofday(&now, 0);
+    gettimeofday(&now, 0);
 
-	printf("%ld.%06ld: received %s data, %d bytes from %s, %zu bytes control messages\n",
-	       (long)now.tv_sec, (long)now.tv_usec,
-	       (recvmsg_flags & MSG_ERRQUEUE) ? "error" : "regular",
-	       res,
-	       inet_ntoa(from_addr->sin_addr),
-	       msg->msg_controllen);
-	for (cmsg = CMSG_FIRSTHDR(msg);
-	     cmsg;
-	     cmsg = CMSG_NXTHDR(msg, cmsg)) {
-		printf("   cmsg len %zu: ", cmsg->cmsg_len);
-		switch (cmsg->cmsg_level) {
-		case SOL_SOCKET:
-			printf("SOL_SOCKET ");
-			switch (cmsg->cmsg_type) {
-			case SO_TIMESTAMP: {
-				struct timeval *stamp =
-					(struct timeval *)CMSG_DATA(cmsg);
-				printf("SO_TIMESTAMP %ld.%06ld",
-				       (long)stamp->tv_sec,
-				       (long)stamp->tv_usec);
-				break;
-			}
-			case SO_TIMESTAMPNS: {
-				struct timespec *stamp =
-					(struct timespec *)CMSG_DATA(cmsg);
-				printf("SO_TIMESTAMPNS %ld.%09ld",
-				       (long)stamp->tv_sec,
-				       (long)stamp->tv_nsec);
-				break;
-			}
-			case SO_TIMESTAMPING: {
-				struct timespec *stamp =
-					(struct timespec *)CMSG_DATA(cmsg);
-				printf("SO_TIMESTAMPING ");
-				printf("SW %ld.%09ld ",
-				       (long)stamp->tv_sec,
-				       (long)stamp->tv_nsec);
-				stamp++;
-				/* skip deprecated HW transformed */
-				stamp++;
-				printf("HW raw %ld.%09ld",
-				       (long)stamp->tv_sec,
-				       (long)stamp->tv_nsec);
-				break;
-			}
-			default:
-				printf("type %d", cmsg->cmsg_type);
-				break;
-			}
-			break;
-		case IPPROTO_IP:
-			printf("IPPROTO_IP ");
-			switch (cmsg->cmsg_type) {
-			case IP_RECVERR: {
-				struct sock_extended_err *err =
-					(struct sock_extended_err *)CMSG_DATA(cmsg);
-				printf("IP_RECVERR ee_errno '%s' ee_origin %d => %s",
-					strerror(err->ee_errno),
-					err->ee_origin,
+    printf("%ld.%06ld: received %s data, %d bytes from %s, %zu bytes control messages\n",
+           (long)now.tv_sec, (long)now.tv_usec,
+           (recvmsg_flags & MSG_ERRQUEUE) ? "error" : "regular",
+           res,
+           inet_ntoa(from_addr->sin_addr),
+           msg->msg_controllen);
+    for (cmsg = CMSG_FIRSTHDR(msg);
+         cmsg;
+         cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        printf("   cmsg len %zu: ", cmsg->cmsg_len);
+        switch (cmsg->cmsg_level) {
+        case SOL_SOCKET:
+            printf("SOL_SOCKET ");
+            switch (cmsg->cmsg_type) {
+            case SO_TIMESTAMP: {
+                struct timeval *stamp =
+                    (struct timeval *)CMSG_DATA(cmsg);
+                printf("SO_TIMESTAMP %ld.%06ld",
+                       (long)stamp->tv_sec,
+                       (long)stamp->tv_usec);
+                break;
+            }
+            case SO_TIMESTAMPNS: {
+                struct timespec *stamp =
+                    (struct timespec *)CMSG_DATA(cmsg);
+                printf("SO_TIMESTAMPNS %ld.%09ld",
+                       (long)stamp->tv_sec,
+                       (long)stamp->tv_nsec);
+                break;
+            }
+            case SO_TIMESTAMPING: {
+                struct timespec *stamp =
+                    (struct timespec *)CMSG_DATA(cmsg);
+                printf("SO_TIMESTAMPING ");
+                printf("SW %ld.%09ld ",
+                       (long)stamp->tv_sec,
+                       (long)stamp->tv_nsec);
+                stamp++;
+                /* skip deprecated HW transformed */
+                stamp++;
+                printf("HW raw %ld.%09ld",
+                       (long)stamp->tv_sec,
+                       (long)stamp->tv_nsec);
+                break;
+            }
+            default:
+                printf("type %d", cmsg->cmsg_type);
+                break;
+            }
+            break;
+        case IPPROTO_IP:
+            printf("IPPROTO_IP ");
+            switch (cmsg->cmsg_type) {
+            case IP_RECVERR: {
+                struct sock_extended_err *err =
+                    (struct sock_extended_err *)CMSG_DATA(cmsg);
+                printf("IP_RECVERR ee_errno '%s' ee_origin %d => %s",
+                    strerror(err->ee_errno),
+                    err->ee_origin,
 #ifdef SO_EE_ORIGIN_TIMESTAMPING
-					err->ee_origin == SO_EE_ORIGIN_TIMESTAMPING ?
-					"bounced packet" : "unexpected origin"
+                    err->ee_origin == SO_EE_ORIGIN_TIMESTAMPING ?
+                    "bounced packet" : "unexpected origin"
 #else
-					"probably SO_EE_ORIGIN_TIMESTAMPING"
+                    "probably SO_EE_ORIGIN_TIMESTAMPING"
 #endif
-					);
-				if (res < sizeof(sync))
-					printf(" => truncated data?!");
-				else if (!memcmp(sync, data + res - sizeof(sync),
-							sizeof(sync)))
-					printf(" => GOT OUR DATA BACK (HURRAY!)");
-				break;
-			}
-			case IP_PKTINFO: {
-				struct in_pktinfo *pktinfo =
-					(struct in_pktinfo *)CMSG_DATA(cmsg);
-				printf("IP_PKTINFO interface index %u",
-					pktinfo->ipi_ifindex);
-				break;
-			}
-			default:
-				printf("type %d", cmsg->cmsg_type);
-				break;
-			}
-			break;
-		default:
-			printf("level %d type %d",
-				cmsg->cmsg_level,
-				cmsg->cmsg_type);
-			break;
-		}
-		printf("\n");
-	}
+                    );
+                break;
+            }
+            case IP_PKTINFO: {
+                struct in_pktinfo *pktinfo =
+                    (struct in_pktinfo *)CMSG_DATA(cmsg);
+                printf("IP_PKTINFO interface index %u",
+                    pktinfo->ipi_ifindex);
+                break;
+            }
+            default:
+                printf("type %d", cmsg->cmsg_type);
+                break;
+            }
+            break;
+        default:
+            printf("level %d type %d",
+                cmsg->cmsg_level,
+                cmsg->cmsg_type);
+            break;
+        }
+        printf("\n");
+    }
 }
 
 static void recvpacket(int sock, int recvmsg_flags)
 {
-	char data[256];
-	struct msghdr msg;
-	struct iovec entry;
-	struct sockaddr_in from_addr;
-	struct {
-		struct cmsghdr cm;
-		char control[512];
-	} control;
-	int res;
+    char data[256];
+    struct msghdr msg;
+    struct iovec entry;
+    struct sockaddr_in from_addr;
+    struct {
+        struct cmsghdr cm;
+        char control[512];
+    } control;
+    int res;
 
-	memset(&msg, 0, sizeof(msg));
-	msg.msg_iov = &entry;
-	msg.msg_iovlen = 1;
-	entry.iov_base = data;
-	entry.iov_len = sizeof(data);
-	msg.msg_name = (caddr_t)&from_addr;
-	msg.msg_namelen = sizeof(from_addr);
-	msg.msg_control = &control;
-	msg.msg_controllen = sizeof(control);
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = &entry;
+    msg.msg_iovlen = 1;
+    entry.iov_base = data;
+    entry.iov_len = sizeof(data);
+    msg.msg_name = (caddr_t)&from_addr;
+    msg.msg_namelen = sizeof(from_addr);
+    msg.msg_control = &control;
+    msg.msg_controllen = sizeof(control);
 
-	res = recvmsg(sock, &msg, recvmsg_flags|MSG_DONTWAIT);
-	if (res < 0) {
-		printf("%s %s: %s\n",
-		       "recvmsg",
-		       (recvmsg_flags & MSG_ERRQUEUE) ? "error" : "regular",
-		       strerror(errno));
-	} else {
-		printpacket(&msg, res, data,
-			    sock, recvmsg_flags);
-	}
+    res = recvmsg(sock, &msg, recvmsg_flags|MSG_DONTWAIT);
+    if (res < 0) {
+        printf("%s %s: %s\n",
+               "recvmsg",
+               (recvmsg_flags & MSG_ERRQUEUE) ? "error" : "regular",
+               strerror(errno));
+    } else {
+        printpacket(&msg, res, data,
+                sock, recvmsg_flags);
+    }
 }
 
 
 int main(int argc, char **argv){
-    struct sockaddr_in myaddr;	//my address
-    struct sockaddr_in remaddr;	//remote address
+    struct sockaddr_in myaddr;    //my address
+    struct sockaddr_in remaddr;    //remote address
     socklen_t slen=sizeof(remaddr);
     int fd; //my socket
     int port; //port number
     char buf[BUFSIZE]; //receive buffer
     int times; //number of messages send
     char host_to_contact[50];
-    struct hostent *hp, *gethostbyname();
+    struct hostent *gethostbyname();
     char ip[100];
     struct hostent *he;
     struct in_addr **addr_list;
