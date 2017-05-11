@@ -337,6 +337,7 @@ int main(int argc, char **argv){
             printf("\n---------------\n");
             continue;
         }
+        sleep(1);
     }
     close(fd);
 
